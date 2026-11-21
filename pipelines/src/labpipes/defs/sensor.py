@@ -15,12 +15,15 @@ import dagster as dg
 from ..partitions import trip_months
 from ..resources import DataBucket
 
-# One month, end to end. The blocking checks (schema_contract, and any blocking quality check) are part
-# of the run, so a month that fails one never reaches raw_trips or the mart. zone_hour_stats is
-# unpartitioned and rebuilt in full; taxi_zones is small and reloaded so the mart always has zone names.
+# One month, end to end. The blocking checks (schema_contract, the blocking quality checks,
+# feature_contract) are part of the run, so a month that fails one never reaches what's after it.
+# zone_hour_stats is unpartitioned and rebuilt in full; taxi_zones is small and reloaded so the mart
+# always has zone names. trip_features (S2) is the month's model inputs, ready for train_model.
 ingest_month = dg.define_asset_job(
     "ingest_month",
-    selection=dg.AssetSelection.assets("taxi_zones", "trip_files", "raw_trips", "stg_trips", "zone_hour_stats"),
+    selection=dg.AssetSelection.assets(
+        "taxi_zones", "trip_files", "raw_trips", "stg_trips", "zone_hour_stats", "trip_features"
+    ),
 )
 
 
