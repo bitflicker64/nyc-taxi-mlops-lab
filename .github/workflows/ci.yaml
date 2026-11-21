@@ -1,0 +1,67 @@
+# CI (S0): make check on every push and pull request; on main, build the arm64 app image and push it
+# to GHCR. GitHub-hosted runners only: a fork's pull request never reaches your hosts from here.
+# Deploying is cd.yaml's job, which runs after this succeeds on main (workflow_run).
+#
+# Image tag scheme (decision record in decisions/): sha-<first 7 of the commit>, one immutable tag
+# per commit and no moving tags. A rollback redeploys an earlier sha- tag.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded PR runs can go; a main run is never cancelled, so every main commit gets its image.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: 1.17.2
+          terraform_wrapper: false
+      # Docker is running on GitHub's Ubuntu runners, so lint-observability isn't skipped here.
+      - run: make check
+
+  image:
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    # Native arm64 (the hosts are Graviton): no QEMU emulation.
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Image name and tag
+        id: img
+        run: |
+          echo "prefix=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7.4.0
+        with:
+          context: app
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.img.outputs.prefix }}/app:${{ steps.img.outputs.tag }}
+          # /version reports this, and CD's smoke test compares it with the commit it deployed.
+          build-args: GIT_SHA=${{ github.sha }}
+          # Links the package to this repo, so this repo's GITHUB_TOKEN can pull it in CD.
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=app
+          cache-to: type=gha,scope=app,mode=max
