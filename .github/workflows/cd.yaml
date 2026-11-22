@@ -77,8 +77,15 @@ jobs:
       - name: Smoke-test what riders get
         run: |
           base=http://127.0.0.1
-          curl -fsS --retry 10 --retry-all-errors --retry-delay 2 "$base/version" |
-            jq -e --arg sha "$HEAD_SHA" '.git_sha == $sha'
+          # Traefik's file provider picks up the new route a moment after `switch` writes it, so the
+          # first requests can still reach the old colour. Wait for riders to get this commit.
+          sha=none
+          for _ in $(seq 1 15); do
+            sha=$(curl -fsS -m 5 "$base/version" | jq -r .git_sha) && [ "$sha" = "$HEAD_SHA" ] && break
+            sleep 2
+          done
+          [ "$sha" = "$HEAD_SHA" ] || { echo "riders still get $sha after 30 s, want $HEAD_SHA" >&2; exit 1; }
+          echo "riders get $sha"
           curl -fsS -X POST "$base/predict" -H 'Content-Type: application/json' \
             -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}'
           echo

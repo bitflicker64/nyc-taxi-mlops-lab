@@ -40,8 +40,16 @@ jobs:
         run: |
           start=$(date +%s)
           deploy/web.sh smoke "$TARGET"
+          want=$(curl -fsS -m 5 -H "X-Lab-Color: $TARGET" http://127.0.0.1/version | jq -r .git_sha)
           deploy/web.sh switch "$TARGET"
-          curl -fsS --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1/version
-          echo
+          # Traefik picks up the new route a moment after the switch: stop the clock when riders get it.
+          # (When both colours run the same commit, this can't tell them apart and passes at once.)
+          got=none
+          for _ in $(seq 1 30); do
+            got=$(curl -fsS -m 5 http://127.0.0.1/version | jq -r .git_sha) && [ "$got" = "$want" ] && break
+            sleep 1
+          done
+          [ "$got" = "$want" ] || { echo "riders still get $got after 30 s, want $want" >&2; exit 1; }
+          echo "riders get $TARGET ($got)"
           echo "rolled back to $TARGET in $(( $(date +%s) - start )) s"
           deploy/web.sh status
