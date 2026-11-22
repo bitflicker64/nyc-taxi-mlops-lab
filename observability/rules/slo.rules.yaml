@@ -2,4 +2,88 @@
 # Prometheus rule format: https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/
 # Metric names are contracts/metrics.yaml's. `make check` runs promtool on this file and on any
 # *.test.yaml next to it.
-groups: []
+#
+# Three SLOs on /predict (observability/slo.yaml), each 99% over 30 days, so the error budget is 1%.
+# Each SLI is recorded as an error ratio (bad / all) over 5m, 30m, 1h and 6h. Alerts are multi-window
+# burn rates (Google SRE workbook, ch. 5): the long window says the budget is really going, the short
+# one says it's still going now, so an alert stops soon after the fix.
+#   page:   burn > 14.4x over 1h and 5m   (2% of a 30-day budget in an hour)
+#   ticket: burn >  6x   over 6h and 30m  (5% of the budget in six hours)
+# Burn rate = error ratio / 0.01, so the thresholds below are 14.4 * 0.01 and 6 * 0.01.
+# With no traffic every ratio is 0/0: no series, so nothing fires.
+groups:
+  - name: slo-predict-sli
+    interval: 1m
+    rules:
+      # Model answered: a quote from the 12.25 fallback is a bad event. The app still answers 200 then,
+      # so availability can't see it.
+      - record: slo:predict_fallback:ratio_rate5m
+        expr: (sum(rate(lab_predictions_total{source="fallback"}[5m])) or vector(0)) / sum(rate(lab_predictions_total[5m]))
+      - record: slo:predict_fallback:ratio_rate30m
+        expr: (sum(rate(lab_predictions_total{source="fallback"}[30m])) or vector(0)) / sum(rate(lab_predictions_total[30m]))
+      - record: slo:predict_fallback:ratio_rate1h
+        expr: (sum(rate(lab_predictions_total{source="fallback"}[1h])) or vector(0)) / sum(rate(lab_predictions_total[1h]))
+      - record: slo:predict_fallback:ratio_rate6h
+        expr: (sum(rate(lab_predictions_total{source="fallback"}[6h])) or vector(0)) / sum(rate(lab_predictions_total[6h]))
+
+      # Availability: a 5xx from the app for /predict is a bad event (422 is the rider's mistake, not ours).
+      - record: slo:predict_errors:ratio_rate5m
+        expr: (sum(rate(lab_http_requests_total{route="/predict",code=~"5.."}[5m])) or vector(0)) / sum(rate(lab_http_requests_total{route="/predict"}[5m]))
+      - record: slo:predict_errors:ratio_rate30m
+        expr: (sum(rate(lab_http_requests_total{route="/predict",code=~"5.."}[30m])) or vector(0)) / sum(rate(lab_http_requests_total{route="/predict"}[30m]))
+      - record: slo:predict_errors:ratio_rate1h
+        expr: (sum(rate(lab_http_requests_total{route="/predict",code=~"5.."}[1h])) or vector(0)) / sum(rate(lab_http_requests_total{route="/predict"}[1h]))
+      - record: slo:predict_errors:ratio_rate6h
+        expr: (sum(rate(lab_http_requests_total{route="/predict",code=~"5.."}[6h])) or vector(0)) / sum(rate(lab_http_requests_total{route="/predict"}[6h]))
+
+      # Latency: a /predict slower than 250 ms (a bucket boundary in contracts/metrics.yaml) is a bad event.
+      - record: slo:predict_slow:ratio_rate5m
+        expr: 1 - sum(rate(lab_http_request_duration_seconds_bucket{route="/predict",le="0.25"}[5m])) / sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[5m]))
+      - record: slo:predict_slow:ratio_rate30m
+        expr: 1 - sum(rate(lab_http_request_duration_seconds_bucket{route="/predict",le="0.25"}[30m])) / sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[30m]))
+      - record: slo:predict_slow:ratio_rate1h
+        expr: 1 - sum(rate(lab_http_request_duration_seconds_bucket{route="/predict",le="0.25"}[1h])) / sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[1h]))
+      - record: slo:predict_slow:ratio_rate6h
+        expr: 1 - sum(rate(lab_http_request_duration_seconds_bucket{route="/predict",le="0.25"}[6h])) / sum(rate(lab_http_request_duration_seconds_count{route="/predict"}[6h]))
+
+  - name: slo-predict-alerts
+    interval: 1m
+    rules:
+      - alert: PredictModelAnsweredFastBurn
+        expr: slo:predict_fallback:ratio_rate1h > 0.144 and slo:predict_fallback:ratio_rate5m > 0.144
+        labels: {severity: page, slo: predict-model-answered}
+        annotations:
+          summary: Riders are getting the 12.25 fallback instead of the model
+          description: Over 14.4% of quotes in the last hour and 5 minutes came from the fallback. Check serving (deploy/web.sh status) and MLflow.
+      - alert: PredictModelAnsweredSlowBurn
+        expr: slo:predict_fallback:ratio_rate6h > 0.06 and slo:predict_fallback:ratio_rate30m > 0.06
+        labels: {severity: ticket, slo: predict-model-answered}
+        annotations:
+          summary: The fallback is answering too often
+          description: Over 6% of quotes in the last 6 hours and 30 minutes came from the fallback.
+
+      - alert: PredictAvailabilityFastBurn
+        expr: slo:predict_errors:ratio_rate1h > 0.144 and slo:predict_errors:ratio_rate5m > 0.144
+        labels: {severity: page, slo: predict-availability}
+        annotations:
+          summary: /predict is failing with 5xx
+          description: Over 14.4% of /predict requests in the last hour and 5 minutes were 5xx. Check the app (deploy/web.sh status) and Traefik.
+      - alert: PredictAvailabilitySlowBurn
+        expr: slo:predict_errors:ratio_rate6h > 0.06 and slo:predict_errors:ratio_rate30m > 0.06
+        labels: {severity: ticket, slo: predict-availability}
+        annotations:
+          summary: /predict returns too many 5xx
+          description: Over 6% of /predict requests in the last 6 hours and 30 minutes were 5xx.
+
+      - alert: PredictLatencyFastBurn
+        expr: slo:predict_slow:ratio_rate1h > 0.144 and slo:predict_slow:ratio_rate5m > 0.144
+        labels: {severity: page, slo: predict-latency}
+        annotations:
+          summary: /predict is slower than 250 ms for too many riders
+          description: Over 14.4% of /predict requests in the last hour and 5 minutes took over 250 ms. Check serving latency and host CPU.
+      - alert: PredictLatencySlowBurn
+        expr: slo:predict_slow:ratio_rate6h > 0.06 and slo:predict_slow:ratio_rate30m > 0.06
+        labels: {severity: ticket, slo: predict-latency}
+        annotations:
+          summary: /predict is often slower than 250 ms
+          description: Over 6% of /predict requests in the last 6 hours and 30 minutes took over 250 ms.

@@ -5,6 +5,9 @@
 // Rules are Prometheus relabelling (https://grafana.com/docs/alloy/latest/reference/components/prometheus/prometheus.relabel/):
 //   rule { source_labels = ["__name__"]  regex = "node_(cpu|memory)_.*"  action = "keep" }
 //   rule { regex = "id"  action = "labeldrop" }
+//
+// A keep-list (decision 014): what a dashboard panel, an SLO or an incident would use, and nothing else.
+// Before it, 3,446 series for two hosts; most were cAdvisor filesystem metrics and node network detail.
 
 declare "host" {
 	argument "forward_to" { }
@@ -12,7 +15,28 @@ declare "host" {
 	prometheus.relabel "rules" {
 		forward_to = argument.forward_to.value
 
-		// Your rules for the host's series: CPU? memory? disk? which network devices?
+		// CPU (Host CPU busy panel; iowait and steal in an incident), memory, the root disk, network
+		// bytes, load, and up (is the exporter alive).
+		rule {
+			source_labels = ["__name__"]
+			regex         = "up|node_cpu_seconds_total|node_memory_(MemAvailable|MemTotal)_bytes|node_filesystem_(avail|size)_bytes|node_network_(receive|transmit)_bytes_total|node_load1"
+			action        = "keep"
+		}
+
+		// Only real disks: tmpfs and the EFI partition never fill up in a way that matters here.
+		rule {
+			source_labels = ["__name__", "fstype"]
+			regex         = "node_filesystem_.*;(tmpfs|vfat|overlay|squashfs|nsfs)"
+			action        = "drop"
+		}
+
+		// Only the host's own interface: loopback and Docker's bridges and veths are noise, and veths
+		// get a new name every time a container is recreated.
+		rule {
+			source_labels = ["__name__", "device"]
+			regex         = "node_network_.*;(lo|veth.*|br-.*|docker.*)"
+			action        = "drop"
+		}
 	}
 
 	export "receiver" {
@@ -26,7 +50,28 @@ declare "containers" {
 	prometheus.relabel "rules" {
 		forward_to = argument.forward_to.value
 
-		// Your rules for the containers' series: which metrics, and which labels change on every deploy?
+		// Cgroups that aren't a named container (the root, system slices): the host series cover them.
+		rule {
+			source_labels = ["__name__", "name"]
+			regex         = "container_.*;"
+			action        = "drop"
+		}
+
+		// CPU and memory (Container memory panel), restarts (start time changes), and the memory limit
+		// and OOM kills, which explain a restart.
+		rule {
+			source_labels = ["__name__"]
+			regex         = "up|container_(cpu_usage_seconds_total|memory_working_set_bytes|spec_memory_limit_bytes|start_time_seconds|oom_events_total)"
+			action        = "keep"
+		}
+
+		// Labels that change on every deploy: the container id, the image tag (sha-<commit>) and Compose's
+		// hashes. Each new value is a new series, so three deploys tripled every container's series until
+		// the old ones went stale. `name` (lab-app-app-green-1) stays the same across deploys.
+		rule {
+			regex  = "id|image|container_label_.*"
+			action = "labeldrop"
+		}
 	}
 
 	export "receiver" {
@@ -40,7 +85,14 @@ declare "services" {
 	prometheus.relabel "rules" {
 		forward_to = argument.forward_to.value
 
-		// Your rules for the services' series (contracts/metrics.yaml, Traefik, runtime metrics).
+		// contracts/metrics.yaml (lab_*: riders, models, SLOs), Traefik's per-service metrics (S8's canary
+		// compares serving-champion and serving-challenger), and up for each target. Runtime metrics
+		// (go_*, python_*, process_*) go: container CPU and memory already answer "is it leaking?".
+		rule {
+			source_labels = ["__name__"]
+			regex         = "up|lab_.*|traefik_service_.*"
+			action        = "keep"
+		}
 	}
 
 	export "receiver" {

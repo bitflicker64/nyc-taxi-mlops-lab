@@ -1,9 +1,47 @@
 # Service level objectives for the ride app (S5, decision 013). rules/slo.rules.yaml computes them.
 # One entry per SLO: what's measured (the SLI, from contracts/metrics.yaml), the objective, why that
 # number, and the alert that tells you it's being missed.
+#
+# All three: a 30-day window, 99%, so 1% of events may be bad (about 7 hours' worth a month).
+# Pages: burn rate over 14.4x for 1h and 5m. Tickets: over 6x for 6h and 30m.
 slos:
+  - name: predict-model-answered
+    sli: >-
+      Share of quotes produced by the model, not the 12.25 fallback:
+      lab_predictions_total{source="model"} / lab_predictions_total.
+      Recorded as the bad share: slo:predict_fallback:ratio_rate{5m,30m,1h,6h}.
+    objective: 0.99
+    why: >-
+      This is what the project is for. When serving is down or slow, the app still answers 200 with
+      12.25, so availability stays at 100% and only this SLI sees riders getting a non-answer. 99%
+      leaves room for a reload or a blue-green switch costing a few seconds, and for serving's 300 ms
+      timeout tripping on the odd slow request; 99.9% would make every serving restart a budget event
+      on a single small host.
+    alert: PredictModelAnsweredFastBurn (page), PredictModelAnsweredSlowBurn (ticket)
+
   - name: predict-availability
-    sli:
-    objective:
-    why:
-    alert:
+    sli: >-
+      Share of /predict requests the app didn't answer with a 5xx:
+      lab_http_requests_total{route="/predict", code!~"5.."} / lab_http_requests_total{route="/predict"}.
+      A 422 (unknown zone) is the rider's mistake and counts as good. Recorded as the bad share:
+      slo:predict_errors:ratio_rate{5m,30m,1h,6h}.
+    objective: 0.99
+    why: >-
+      A 5xx is a rider with no quote at all. The app has a fallback for serving, so a 5xx means the
+      app itself is broken. One host and one live colour at a time: a 99.9% promise isn't one this
+      setup can keep through a host reboot (about a minute, S4).
+    alert: PredictAvailabilityFastBurn (page), PredictAvailabilitySlowBurn (ticket)
+
+  - name: predict-latency
+    sli: >-
+      Share of /predict requests answered in 250 ms or less, measured inside the app:
+      lab_http_request_duration_seconds_bucket{route="/predict", le="0.25"} / _count.
+      Recorded as the bad share: slo:predict_slow:ratio_rate{5m,30m,1h,6h}.
+    objective: 0.99
+    why: >-
+      A quote is shown while the rider waits. 250 ms is a bucket boundary in contracts/metrics.yaml
+      (a threshold between buckets can't be measured), and it's under serving's 300 ms timeout, so a
+      request that would fall back is already slow. Measured p95 inside serving is about 3 ms (S2),
+      so 250 ms leaves room for the network and the app; a stricter threshold would mostly measure
+      the host, not the model.
+    alert: PredictLatencyFastBurn (page), PredictLatencySlowBurn (ticket)

@@ -71,3 +71,11 @@ module "wiki_secret" {
   name        = "lab/wiki"
   description = "Wiki URL and token for the support assistant (S6). Value set outside Terraform."
 }
+
+# Grafana Cloud remote write (S5): {"url", "user", "token"}. Alloy on each host reads it with the
+# instance profile; the value is put from the laptop, so it's never in Terraform state or GitHub.
+module "grafana_secret" {
+  source      = "../modules/secret"
+  name        = "lab/grafana"
+  description = "Grafana Cloud remote-write URL, user and token for Alloy (S5). Value set outside Terraform."
+}

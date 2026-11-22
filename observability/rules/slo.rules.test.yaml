@@ -1,0 +1,124 @@
+# promtool unit tests for slo.rules.yaml (S5): an outage pages, a short spike doesn't.
+# Traffic is 60 quotes a minute throughout. Series values: 'a+bxn' is a, a+b, ... (n+1 values, one a
+# minute), so '0+60x60' is a counter that reaches 3600 at 60m.
+rule_files: [slo.rules.yaml]
+evaluation_interval: 1m
+
+tests:
+  # Serving goes down at 60m and stays down: every quote is the fallback. The 1h ratio passes 14.4%
+  # about 9 minutes in, so the page fires between 65m and 75m.
+  - name: serving outage pages
+    interval: 1m
+    input_series:
+      - series: 'lab_predictions_total{source="model"}'
+        values: '0+60x60 3600+0x30'
+      - series: 'lab_predictions_total{source="fallback"}'
+        values: '0x60 0+60x30'
+    alert_rule_test:
+      - eval_time: 59m
+        alertname: PredictModelAnsweredFastBurn
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: PredictModelAnsweredFastBurn
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: PredictModelAnsweredFastBurn
+        exp_alerts:
+          - exp_labels: {severity: page, slo: predict-model-answered}
+            exp_annotations:
+              summary: Riders are getting the 12.25 fallback instead of the model
+              description: Over 14.4% of quotes in the last hour and 5 minutes came from the fallback. Check serving (deploy/web.sh status) and MLflow.
+
+  # Two minutes of fallback, then the model again (a serving reload that took too long). The 5m ratio
+  # jumps, but the 1h ratio stays near 3%: no page, before or after.
+  - name: short spike doesn't page
+    interval: 1m
+    input_series:
+      - series: 'lab_predictions_total{source="model"}'
+        values: '0+60x60 3600+0x2 3600+60x30'
+      - series: 'lab_predictions_total{source="fallback"}'
+        values: '0x60 0+60x2 120+0x30'
+    alert_rule_test:
+      - eval_time: 63m
+        alertname: PredictModelAnsweredFastBurn
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: PredictModelAnsweredFastBurn
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: PredictModelAnsweredSlowBurn
+        exp_alerts: []
+
+  # Serving is down 60m-80m, then fixed. At 90m the 1h ratio is still about 33% (the outage is in it),
+  # but the 5m ratio is 0: the page has cleared. This is what the short window is for.
+  - name: page clears soon after the fix
+    interval: 1m
+    input_series:
+      - series: 'lab_predictions_total{source="model"}'
+        values: '0+60x60 3600+0x20 3600+60x30'
+      - series: 'lab_predictions_total{source="fallback"}'
+        values: '0x60 0+60x20 1200+0x30'
+    alert_rule_test:
+      - eval_time: 78m
+        alertname: PredictModelAnsweredFastBurn
+        exp_alerts:
+          - exp_labels: {severity: page, slo: predict-model-answered}
+            exp_annotations:
+              summary: Riders are getting the 12.25 fallback instead of the model
+              description: Over 14.4% of quotes in the last hour and 5 minutes came from the fallback. Check serving (deploy/web.sh status) and MLflow.
+      - eval_time: 90m
+        alertname: PredictModelAnsweredFastBurn
+        exp_alerts: []
+
+  # The app answers 500 for every /predict from 60m.
+  - name: 5xx outage pages
+    interval: 1m
+    input_series:
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="200"}'
+        values: '0+60x60 3600+0x30'
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="500"}'
+        values: '0x60 0+60x30'
+      # /healthz traffic must not dilute the ratio.
+      - series: 'lab_http_requests_total{route="/healthz",method="GET",code="200"}'
+        values: '0+600x90'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: PredictAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: page, slo: predict-availability}
+            exp_annotations:
+              summary: /predict is failing with 5xx
+              description: Over 14.4% of /predict requests in the last hour and 5 minutes were 5xx. Check the app (deploy/web.sh status) and Traefik.
+
+  # A 422 (bad zone) is the rider's mistake, not a failure: a flood of them never pages.
+  - name: 422s don't page
+    interval: 1m
+    input_series:
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="200"}'
+        values: '0+60x90'
+      - series: 'lab_http_requests_total{route="/predict",method="POST",code="422"}'
+        values: '0+600x90'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: PredictAvailabilityFastBurn
+        exp_alerts: []
+
+  # From 60m every /predict takes longer than 250 ms: the le="0.25" bucket stops growing, the count doesn't.
+  - name: slow outage pages
+    interval: 1m
+    input_series:
+      - series: 'lab_http_request_duration_seconds_bucket{route="/predict",method="POST",le="0.25"}'
+        values: '0+60x60 3600+0x30'
+      - series: 'lab_http_request_duration_seconds_count{route="/predict",method="POST"}'
+        values: '0+60x90'
+    alert_rule_test:
+      - eval_time: 59m
+        alertname: PredictLatencyFastBurn
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: PredictLatencyFastBurn
+        exp_alerts:
+          - exp_labels: {severity: page, slo: predict-latency}
+            exp_annotations:
+              summary: /predict is slower than 250 ms for too many riders
+              description: Over 14.4% of /predict requests in the last hour and 5 minutes took over 250 ms. Check serving latency and host CPU.
