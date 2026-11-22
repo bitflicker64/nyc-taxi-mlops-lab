@@ -1,0 +1,85 @@
+# Promotion (S3): move MLflow's `champion` alias to the challenger (or a version you name), after a
+# required reviewer approves the `production` environment. The only place `champion` ever moves.
+#   gh workflow run promote.yaml                  (promote the current challenger)
+#   gh workflow run promote.yaml -f version=3     (any evaluated version: also how a model rolls back)
+#
+# Decision 010: serving picks the new champion up with /reload, so the old model answers until the new
+# one has loaded and warmed up. If riders' check fails afterwards, the old champion is put back.
+# Manual only (workflow_dispatch), so no pull request can reach this self-hosted job.
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Model version to make champion (empty: the current challenger)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    environment: production
+    runs-on: [self-hosted, lab-app]
+    env:
+      MLFLOW: ${{ vars.MLFLOW_TRACKING_URI }}
+      MODEL: trip-duration  # contracts/mlflow.yaml registered_model
+      WANTED: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Pick the version and check the pipeline evaluated it
+        run: |
+          api="$MLFLOW/api/2.0/mlflow"
+          alias_version() { curl -fsS "$api/registered-models/alias?name=$MODEL&alias=$1" 2>/dev/null | jq -r '.model_version.version // empty'; }
+          [[ -z $WANTED || $WANTED =~ ^[0-9]+$ ]] || { echo "version must be a number, got '$WANTED'" >&2; exit 2; }
+          version=${WANTED:-$(alias_version challenger)}
+          [[ -n $version ]] || { echo "no version given and no challenger to promote" >&2; exit 1; }
+          previous=$(alias_version champion)
+          [[ $version != "$previous" ]] || { echo "v$version is already champion" >&2; exit 1; }
+          # Evaluated by the pipeline = carries the tags eval_report writes (contracts/mlflow.yaml).
+          tags=$(curl -fsS "$api/model-versions/get?name=$MODEL&version=$version" | jq -c '[.model_version.tags[]?.key]')
+          for t in training_window holdout_month git_sha mae_min p95_latency_ms champion_mae_min; do
+            jq -e --arg t "$t" 'index($t) != null' <<<"$tags" >/dev/null ||
+              { echo "v$version has no $t tag: the pipeline didn't evaluate it" >&2; exit 1; }
+          done
+          {
+            echo "VERSION=$version"
+            echo "PREVIOUS=${previous:-none}"
+          } >> "$GITHUB_ENV"
+          echo "promoting v$version (champion was ${previous:-none})"
+      - name: Record the outgoing champion and move the alias
+        run: |
+          api="$MLFLOW/api/2.0/mlflow"
+          curl -fsS -X POST "$api/registered-models/set-tag" -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg n "$MODEL" --arg v "$PREVIOUS" '{name: $n, key: "previous_champion", value: $v}')" >/dev/null
+          curl -fsS -X POST "$api/registered-models/alias" -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg n "$MODEL" --arg v "$VERSION" '{name: $n, alias: "champion", version: $v}')" >/dev/null
+          echo "MOVED=true" >> "$GITHUB_ENV"
+          echo "### champion: v$PREVIOUS -> v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+      - name: Make serving use it
+        run: deploy/web.sh reload champion
+      - name: Check what riders get
+        run: |
+          for _ in $(seq 20); do
+            out=$(curl -fsS -X POST http://127.0.0.1/predict -H 'Content-Type: application/json' \
+              -d '{"pickup_zone_id": 132, "dropoff_zone_id": 230, "pickup_datetime": "2024-03-08T17:05:00"}') || out='{}'
+            if jq -e --arg v "$VERSION" '.model.alias == "champion" and .model.version == $v' <<<"$out" >/dev/null; then
+              echo "riders get v$VERSION: $out"; exit 0
+            fi
+            sleep 3  # Traefik health-checks serving every 5 s before it sends traffic
+          done
+          echo "/predict still answers: $out" >&2
+          exit 1
+      - name: Put the old champion back if riders' check failed
+        if: failure() && env.MOVED == 'true' && env.PREVIOUS != 'none'
+        run: |
+          curl -fsS -X POST "$MLFLOW/api/2.0/mlflow/registered-models/alias" -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg n "$MODEL" --arg v "$PREVIOUS" '{name: $n, alias: "champion", version: $v}')" >/dev/null
+          deploy/web.sh reload champion
+          echo "### rolled back to v$PREVIOUS" >> "$GITHUB_STEP_SUMMARY"

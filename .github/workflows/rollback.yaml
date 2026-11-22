@@ -1,0 +1,47 @@
+# App rollback (S3): send traffic back to the other colour, which blue-green leaves running. No build,
+# no deploy: smoke-test the target colour, switch, check what riders get. Seconds, not minutes.
+#   gh workflow run rollback.yaml                 (to whichever colour isn't live)
+#   gh workflow run rollback.yaml -f colour=blue
+# Manual only (workflow_dispatch), so no pull request can reach this self-hosted job.
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      colour:
+        description: "Colour to switch to (empty: the one that isn't live)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-app  # never at the same time as a deploy
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: [self-hosted, lab-app]
+    env:
+      WANTED: ${{ inputs.colour }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Pick the colour
+        run: |
+          live=$(deploy/web.sh live)
+          target=${WANTED:-$([[ $live == blue ]] && echo green || echo blue)}
+          [[ $target =~ ^(blue|green)$ ]] || { echo "colour must be blue or green, got '$target'" >&2; exit 2; }
+          [[ $target != "$live" ]] || { echo "$target is already live" >&2; exit 1; }
+          [[ $(deploy/web.sh tag "$target") != none ]] || { echo "$target runs nothing to roll back to" >&2; exit 1; }
+          echo "TARGET=$target" >> "$GITHUB_ENV"
+          echo "live: $live; rolling back to $target ($(deploy/web.sh tag "$target"))"
+      - name: Smoke-test it, switch, check
+        run: |
+          start=$(date +%s)
+          deploy/web.sh smoke "$TARGET"
+          deploy/web.sh switch "$TARGET"
+          curl -fsS --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1/version
+          echo
+          echo "rolled back to $TARGET in $(( $(date +%s) - start )) s"
+          deploy/web.sh status

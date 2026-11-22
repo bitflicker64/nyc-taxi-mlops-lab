@@ -14,6 +14,11 @@ output "platform_instance_id" {
   value = module.host["platform"].instance_id
 }
 
+# S3: serving on the app host reaches MLflow at this address (MLFLOW_TRACKING_URI repo variable).
+output "platform_private_ip" {
+  value = module.host["platform"].private_ip
+}
+
 output "llm_instance_id" {
   value = module.host["llm"].instance_id
 }
