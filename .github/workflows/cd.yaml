@@ -46,6 +46,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pick the idle colour
         run: |
+          # Compose checks IMAGE_PREFIX even for prepare's one-shot, so set it here, not only for later steps.
+          export IMAGE_PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
           deploy/web.sh prepare
           live=$(deploy/web.sh live)
           idle=$([[ $live == blue ]] && echo green || echo blue)
